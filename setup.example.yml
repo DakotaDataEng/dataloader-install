@@ -1,0 +1,51 @@
+# A setup file for `dl setup plan` and `dl setup apply`: one source, one
+# destination and one table. Copy it, change the values, and keep the file
+# with the client's deployment notes.
+#
+# A secret is never written here. Every secret field is a Key Vault reference,
+# kv://vault/secret, to a vault registered in DataLoader. DataLoader reads the
+# value itself. A literal value under a password, token, secret or connection
+# string key is refused before anything is sent.
+#
+# Field names under `config` depend on the connector type. Read them from
+# GET /api/v1/connectors/types before you change a type.
+version: 1
+
+connections:
+  - key: src_sales_pg
+    name: Sales Postgres
+    type: postgres
+    default_target_schema: public
+    config:
+      host: db.client.example
+      port: 5432
+      database: sales
+      username: dataloader_reader
+      password: kv://client-vault/sales-db-password
+
+destinations:
+  # DataLoader signs in to Databricks with its identity, so no token is stored.
+  # A token is the fallback: set `auth_method: personal_access_token` and add
+  # `token: kv://client-vault/databricks-token`.
+  - key: dest_lake
+    name: Lake
+    type: databricks
+    config:
+      host: adb-1234567890123456.7.azuredatabricks.net
+      auth_method: managed_identity
+      warehouse_id: 1234567890abcdef
+      catalog: main
+      # Loads stage files here. The identity needs READ VOLUME and WRITE VOLUME on it.
+      volume_path: /Volumes/main/dataloader/staging
+
+tables:
+  - connection: src_sales_pg
+    destination: dest_lake
+    environment: test
+    source_schema: public
+    source_table: customers
+    dest_schema: bronze
+    dest_table: customers
+    load_strategy: full
+    test_row_limit_mode: number
+    test_row_limit: 1000

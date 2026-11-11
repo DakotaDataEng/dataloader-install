@@ -1,0 +1,193 @@
+# DataLoader v2 — single-service compose for the simple deploy path (#998).
+#
+# This file is the **default** deploy artifact for prospects + small
+# self-hosted installs. The DataLoader binary brings its own embedded
+# Postgres (#873) so there is no sidecar database service to manage,
+# no `POSTGRES_PASSWORD` to set, and one `docker compose up -d` lands
+# a working install on a fresh Linux VM.
+#
+# When to use this file vs `deploy/docker-compose.yml`:
+#
+#   docker-compose.deploy.yml   (this file)
+#     - Single service (`dataloader`)
+#     - Embedded Postgres inside the container
+#     - For: demos, prospects, small single-VM installs
+#     - Operator quick-start: `docker compose -f docker-compose.deploy.yml up -d`
+#
+#   deploy/docker-compose.yml   (existing, #866 — multi-tenant ops)
+#     - Two services (`dataloader` + sidecar `postgres:16`)
+#     - Pulls from Dakota's ACR (anonymous pull enabled)
+#     - For: customer-tenant production VMs that Dakota staff operate
+#     - Plugins and Updates page Apply / Roll back are unsupported there
+#     - Operator runbook: `deploy/README.md`
+#
+# Operators can flip from embedded-PG → external Postgres post-install
+# via the in-app Settings → Database "Switch fresh" flow (#839 / ADR 0016);
+# no compose edits required. Restart the container after the switch so the
+# new pool binds.
+#
+# security_opt lets the bubblewrap plugin sandbox run (ADR 0019, ADR 0027).
+# Unverified on RHEL/SELinux hosts; check with `... exec dataloader plugin-selftest`.
+#
+# HTTPS termination is NOT bundled. The container exposes port 8080 on
+# `127.0.0.1` by default (`DATALOADER_BIND_ADDR`); put a reverse proxy
+# (Caddy, nginx, Traefik) in front of it if the VM is internet-facing.
+# `docs/admin-guide/deploy.md` has copy-paste snippets.
+
+services:
+  dataloader:
+    # Default to the published image at Dakota's ACR (Standard SKU with
+    # anonymous-pull enabled — no auth required for prospects). Build
+    # locally with `docker build --build-arg ORACLE_DRIVERS=false -t dataloader:local .`
+    # and set `DATALOADER_IMAGE=dataloader:local` in your env to test that
+    # build without publishing. The default tag tracks the latest stable
+    # release; pin to a semver tag (e.g. `:1.0.0`) for reproducibility.
+    # Canonical registry decision: see ADR 0020 (2026-05-18) — switched
+    # from ghcr.io to acrdakotadataloader for Dakota-owned sovereignty.
+    # A site that mirrors the image into its own registry sets
+    # `DATALOADER_IMAGE_REPO` (the repository without a tag; install.sh
+    # --image writes it), so Apply can still change `DATALOADER_TAG` (#1662).
+    # `DATALOADER_IMAGE` pins a full reference and turns Apply off.
+    image: ${DATALOADER_IMAGE:-${DATALOADER_IMAGE_REPO:-acrdakotadataloader.azurecr.io/dataloader}:${DATALOADER_TAG:-stable}}
+    restart: unless-stopped
+    # Plugin sandbox (ADR 0019, ADR 0027): bubblewrap needs namespace syscalls
+    # that Docker's default seccomp and AppArmor profiles block. The profile is
+    # Docker's default plus those syscalls; install.sh copies it from the image.
+    # On Ubuntu 23.10+ hosts (kernel.apparmor_restrict_unprivileged_userns=1)
+    # install.sh loads the host profile `dataloader-container`, which grants
+    # userns, and sets DATALOADER_APPARMOR_PROFILE to it (#1690). Elsewhere
+    # the container runs unconfined, as before. systempaths=unconfined drops
+    # Docker's masked /proc paths, which stop bwrap mounting a fresh /proc;
+    # uid 10001 with no capabilities can at most read what they hide.
+    # cap_drop and no-new-privileges keep it that way: bwrap builds the
+    # sandbox in an unprivileged user namespace and needs neither.
+    security_opt:
+      - seccomp=./deploy/seccomp-bwrap.json
+      - apparmor=${DATALOADER_APPARMOR_PROFILE:-unconfined}
+      - systempaths=unconfined
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Default to localhost-only so an internet-facing VM doesn't
+    # accidentally publish DataLoader without a reverse proxy in front.
+    # Demos on a private LAN can override `DATALOADER_BIND_ADDR=0.0.0.0`
+    # in `.env`.
+    ports:
+      - "${DATALOADER_BIND_ADDR:-127.0.0.1}:${DATALOADER_PORT:-8080}:8080"
+    environment:
+      DL_HOST: "0.0.0.0"
+      DL_PORT: "8080"
+      DL_DEV_MODE: "false"
+      # State directory inside the container — holds:
+      #   - jwt.key (auto-generated, sealed mode 0600, #835)
+      #   - pg/install + pg/data (embedded Postgres cluster, #873;
+      #     first boot unpacks about 30 MB from the binary, no download
+      #     since #1476)
+      #   - future per-instance state
+      # Persisted to the named `dataloader-data` volume below so
+      # `docker compose down && up -d` keeps both the JWT secret and
+      # the embedded PG cluster intact.
+      DL_DATA_DIR: "/var/lib/dataloader"
+      # `RUST_LOG` defaults to info; flip to `debug` when troubleshooting
+      # a stuck boot. The binary's JSON formatter keeps logs grep-able
+      # under `docker compose logs dataloader`.
+      RUST_LOG: "${RUST_LOG:-info,dataloader=info}"
+      # First-boot admin seed (#1026 / #1134). When BOTH are set on the
+      # host shell (or in `.env`) at the moment compose starts the
+      # container, the binary inserts one admin row on first boot and
+      # silently no-ops on every subsequent boot. Compose's
+      # `environment:` block is an explicit allow-list, not implicit
+      # passthrough — without these two lines, a host shell
+      # `set DL_BOOTSTRAP_ADMIN_*=...` does NOT reach the container and
+      # the seed silently doesn't run. `:-` makes them empty when unset;
+      # the seed function treats empty-string identically to unset (see
+      # `crates/core/src/auth/bootstrap.rs:64-77`), so post-first-boot
+      # environments with the vars cleared still no-op cleanly.
+      DL_BOOTSTRAP_ADMIN_EMAIL: "${DL_BOOTSTRAP_ADMIN_EMAIL:-}"
+      DL_BOOTSTRAP_ADMIN_PASSWORD: "${DL_BOOTSTRAP_ADMIN_PASSWORD:-}"
+      # Fan-out dispatch callback URL (#1351). Public URL ACA Jobs
+      # workers callback to when partition execution terminates. For
+      # local-dev demos: a cloudflared tunnel URL that forwards to
+      # this container's :8080. For production deploys: the
+      # coordinator's own external hostname. Empty/unset ⇒ runner
+      # stays in fall-back-to-Local mode (no regression).
+      DL_FANOUT_CALLBACK_BASE: "${DL_FANOUT_CALLBACK_BASE:-}"
+      # The install's image repository (#1679). The Updates page checks its
+      # tags when Settings, Updates names no registry. Empty without
+      # --image, which means our registry.
+      DL_IMAGE_REPO: "${DATALOADER_IMAGE_REPO:-}"
+      # DataLoader's own identity (#1712, ADR 0035). `imds` on an Azure VM
+      # with a managed identity (`install.sh --managed-identity` writes it
+      # to `.env`): Key Vault and storage tokens come from the VM, with no
+      # stored secret. AZURE_CLIENT_ID picks a user-assigned identity.
+      # Empty means no managed identity.
+      DL_AZURE_MANAGED_IDENTITY: "${DL_AZURE_MANAGED_IDENTITY:-}"
+      AZURE_CLIENT_ID: "${AZURE_CLIENT_ID:-}"
+      # Compose does not put its project name in the container, and
+      # GET /api/v1/runtime/deployment-target reads it to answer `compose`
+      # instead of `docker` (the Settings restart hints depend on it).
+      DOCKER_COMPOSE_PROJECT_NAME: "${COMPOSE_PROJECT_NAME:-dataloader}"
+    env_file:
+      # Optional. Operators drop overrides (license path, JWT secret for
+      # multi-replica, etc.) into `.env` next to this compose file.
+      # `.env.example` ships the documented set. Compose tolerates a
+      # missing `.env` — only `required: true` would make it mandatory.
+      - path: .env
+        required: false
+    volumes:
+      # State volume — JWT secret + embedded PG cluster + per-instance state.
+      # Persisting this volume is what makes the install upgradable: pulling
+      # a new image and restarting reuses the existing cluster + secret.
+      - dataloader-data:/var/lib/dataloader
+      # License file (optional). Drop `license.bin` into `./license/`
+      # alongside this compose, then set `DL_LICENSE_PATH` in `.env`.
+      # Dakota's public key is compiled in. Without a license the
+      # installation runs on its 30-day trial.
+      # The bind mount is read-only — the operator owns rotation; the
+      # container only reads.
+      - ./license:/etc/dataloader/license:ro
+      # Backups directory — host-visible target for `pg_dump` / `tar`
+      # snapshots. See `docs/admin-guide/deploy.md` "Backup & recovery".
+      - ./backups:/var/backups/dataloader
+      # Update folder shared with the host update unit (#1626, #1627).
+      # Apply on the Updates page writes request.json here, and the root
+      # unit on the host writes result.json back. install.sh creates it
+      # owned by uid 10001 with mode 0750. It is the only host path the
+      # container can write: no Docker socket, no .env.
+      - ./update:/var/lib/dataloader-update
+    healthcheck:
+      # `/api/v1/health` is the liveness route (#285). Cheap DB ping;
+      # returns 200 + JSON `{"status":"healthy","database":true,...}`
+      # when ready. `start_period` is generous (90s) because first boot
+      # unpacks the embedded Postgres, runs initdb and the migrations
+      # before the API listens. Nothing is downloaded (#1476).
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  # State volume mounted at `/var/lib/dataloader` inside the container.
+  #
+  # SECURITY-CRITICAL (per ADR 0023): this volume holds the envelope-
+  # encryption master key at `secrets/master.key`. **Destroying this
+  # volume = the master key is gone = SSO + Azure SP + bootstrap-vault
+  # SP secrets stored in the database cannot be decrypted, and operators
+  # must re-enter all three through the Setup Wizard on the next boot.**
+  # Include `secrets/master.key` in every backup. See
+  # `docs/release-notes/RELEASE_NOTES_1.0.0.md` "Security — at-rest encryption for
+  # outbound secrets" for full detail.
+  #
+  # Backup target: `docker run --rm -v dl_dataloader-data:/src:ro \
+  #                  -v "$(pwd)/backups:/dst" alpine tar czf \
+  #                  /dst/dataloader-state-$(date +%F).tar.gz -C /src .`
+  # The volume name compose chooses is `<project>_dataloader-data`
+  # where `<project>` is `COMPOSE_PROJECT_NAME` or the parent directory
+  # name. `docker volume ls` confirms the exact name on this host.
+  dataloader-data:
